@@ -1,0 +1,57 @@
+name: "Export MMS forced-aligner (ONNX)"
+
+"on":
+  workflow_dispatch:
+    inputs:
+      model_id:
+        description: "Modelo HuggingFace (Wav2Vec2ForCTC) a exportar"
+        required: true
+        default: "MahmoudAshraf/mms-300m-1130-forced-aligner"
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "torch==2.4.1" --index-url https://download.pytorch.org/whl/cpu
+          pip install \
+            "transformers==4.44.2" \
+            "onnx==1.16.2" \
+            "onnxruntime==1.19.2" \
+            "numpy<2"
+
+      - name: Exportar para ONNX
+        env:
+          MODEL_ID: ${{ inputs.model_id }}
+        run: python export.py
+
+      - name: Empacotar
+        run: |
+          cd out
+          zip -j ../wav2vec2-mms-fa-onnx-int8.zip model.int8.onnx vocab.json tokens.txt config.json
+          zip -j ../wav2vec2-mms-fa-onnx-fp32.zip model.onnx      vocab.json tokens.txt config.json
+          cd ..
+          ls -lh wav2vec2-mms-fa-onnx-*.zip
+
+      - name: Publicar release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: wav2vec2-onnx-latest
+          name: "MMS forced-aligner ONNX (latest)"
+          files: |
+            wav2vec2-mms-fa-onnx-int8.zip
+            wav2vec2-mms-fa-onnx-fp32.zip
