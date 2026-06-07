@@ -100,11 +100,15 @@ print("[export] validação OK (argmax idêntico)", flush=True)
 from onnxruntime.quantization import QuantType, quantize_dynamic  # noqa: E402
 
 int8_path = OUT / "model.int8.onnx"
-print("[export] quantizando int8 ...", flush=True)
+print("[export] quantizando int8 (apenas MatMul) ...", flush=True)
+# Quantizamos só os MatMul (o transformer, onde está o grosso dos pesos).
+# As Conv do feature extractor ficam em fp32: quantizá-las gera nós
+# ConvInteger que o CPUExecutionProvider do ONNX Runtime não implementa.
 quantize_dynamic(
     str(fp32_path),
     str(int8_path),
     weight_type=QuantType.QInt8,
+    op_types_to_quantize=["MatMul"],
 )
 print(f"[export] ok -> {int8_path} ({int8_path.stat().st_size/1e6:.0f} MB)", flush=True)
 
