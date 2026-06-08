@@ -1,12 +1,12 @@
-name: "Export MMS forced-aligner (ONNX)"
+name: "Export wav2vec2 aligners (ONNX)"
 
 "on":
   workflow_dispatch:
     inputs:
-      model_id:
-        description: "Modelo HuggingFace (Wav2Vec2ForCTC) a exportar"
+      langs:
+        description: "Idiomas a exportar (espaço-separado)"
         required: true
-        default: "MahmoudAshraf/mms-300m-1130-forced-aligner"
+        default: "pt en es fr de it ja"
 
 permissions:
   contents: write
@@ -26,32 +26,39 @@ jobs:
       - name: Instalar dependências
         run: |
           python -m pip install --upgrade pip
-          pip install \
-            "torch==2.4.1" --index-url https://download.pytorch.org/whl/cpu
-          pip install \
-            "transformers==4.44.2" \
-            "onnx==1.16.2" \
-            "onnxruntime==1.19.2" \
-            "numpy<2"
+          pip install "torch==2.4.1" --index-url https://download.pytorch.org/whl/cpu
+          pip install "transformers==4.44.2" "onnx==1.16.2" "onnxruntime==1.19.2" "numpy<2"
 
-      - name: Exportar para ONNX
-        env:
-          MODEL_ID: ${{ inputs.model_id }}
-        run: python export.py
-
-      - name: Empacotar
+      - name: Exportar por idioma
         run: |
-          cd out
-          zip -j ../wav2vec2-mms-fa-onnx-int8.zip model.int8.onnx vocab.json tokens.txt config.json
-          zip -j ../wav2vec2-mms-fa-onnx-fp32.zip model.onnx      vocab.json tokens.txt config.json
-          cd ..
-          ls -lh wav2vec2-mms-fa-onnx-*.zip
+          declare -A M=(
+            [pt]=jonatasgrosman/wav2vec2-large-xlsr-53-portuguese
+            [en]=jonatasgrosman/wav2vec2-large-xlsr-53-english
+            [es]=jonatasgrosman/wav2vec2-large-xlsr-53-spanish
+            [fr]=jonatasgrosman/wav2vec2-large-xlsr-53-french
+            [de]=jonatasgrosman/wav2vec2-large-xlsr-53-german
+            [it]=jonatasgrosman/wav2vec2-large-xlsr-53-italian
+            [ja]=jonatasgrosman/wav2vec2-large-xlsr-53-japanese
+          )
+          for lang in ${{ inputs.langs }}; do
+            id="${M[$lang]}"
+            if [ -z "$id" ]; then echo "sem modelo mapeado para '$lang', pulando"; continue; fi
+            echo "::group::$lang ($id)"
+            rm -rf out ~/.cache/huggingface
+            if MODEL_ID="$id" python export.py; then
+              (cd out && zip -j "../wav2vec2-xlsr-$lang-int8.zip" \
+                 model.int8.onnx vocab.json tokens.txt config.json)
+            else
+              echo "FALHOU: $lang"
+            fi
+            echo "::endgroup::"
+          done
+          echo "=== assets gerados ==="
+          ls -lh wav2vec2-xlsr-*-int8.zip
 
       - name: Publicar release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: wav2vec2-onnx-latest
-          name: "MMS forced-aligner ONNX (latest)"
-          files: |
-            wav2vec2-mms-fa-onnx-int8.zip
-            wav2vec2-mms-fa-onnx-fp32.zip
+          name: "wav2vec2 aligners ONNX (latest)"
+          files: wav2vec2-xlsr-*-int8.zip

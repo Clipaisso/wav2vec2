@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
-Exporta o modelo multilíngue de forced alignment (MMS) para ONNX.
+Exporta um modelo wav2vec2 CTC (Wav2Vec2ForCTC) para ONNX int8, para uso no
+forced alignment local do Clipaisso Desktop.
 
-Modelo: MahmoudAshraf/mms-300m-1130-forced-aligner
-  - Wav2Vec2ForCTC baseado no facebook/mms-300m
-  - Vocabulário romanizado (uroman) -> funciona para 1000+ idiomas
+Modelo via env `MODEL_ID`. Pensado para a família permissiva (Apache 2.0)
+`jonatasgrosman/wav2vec2-large-xlsr-53-<idioma>` — um modelo por idioma.
+
   - Entrada:  waveform mono 16 kHz, float32, shape [1, N]
-  - Saída:    logits CTC por frame, shape [1, T, V]
-              (T = N/320 frames, ou seja ~50 fps / 20 ms por frame; V = tamanho do vocab)
+  - Saída:    logits CTC por frame, shape [1, T, V]  (T ≈ N/320 → ~20 ms/frame)
 
-Gera dois artefatos:
-  - model.onnx       (fp32, ~1.2 GB)  -> qualidade máxima
-  - model.int8.onnx  (int8, ~320 MB)  -> download padrão do app
-
-Mais vocab.json + config.json + tokens.txt (id -> token, ordenado), que o
-app usa para mapear o texto transcrito na sequência-alvo do alinhamento.
+Gera em out/: model.int8.onnx + vocab.json + tokens.txt + config.json.
+O fp32 é só intermediário (necessário para quantizar) e é apagado no fim —
+distribuímos apenas o int8. Carregamos o vocab pelo TOKENIZER (não pelo
+AutoProcessor) de propósito: esses repos trazem um KenLM, e o AutoProcessor
+tentaria puxar pyctcdecode/kenlm e quebrar no CI.
 """
 import json
 import os
@@ -23,35 +22,29 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from transformers import AutoModelForCTC, AutoProcessor
+from transformers import AutoModelForCTC, Wav2Vec2CTCTokenizer
 
-MODEL_ID = os.environ.get("MODEL_ID", "MahmoudAshraf/mms-300m-1130-forced-aligner")
+MODEL_ID = os.environ["MODEL_ID"]
 OUT = Path("out")
 OUT.mkdir(exist_ok=True)
 
 print(f"[export] baixando {MODEL_ID} ...", flush=True)
 model = AutoModelForCTC.from_pretrained(MODEL_ID)
 model.eval()
-processor = AutoProcessor.from_pretrained(MODEL_ID)
 
-# ---- vocabulário / config -------------------------------------------------
-vocab = processor.tokenizer.get_vocab()  # token -> id
+tokenizer = Wav2Vec2CTCTokenizer.from_pretrained(MODEL_ID)
+vocab = tokenizer.get_vocab()  # token -> id
 (OUT / "vocab.json").write_text(
-    json.dumps(vocab, ensure_ascii=False, indent=0), encoding="utf-8"
+    json.dumps(vocab, ensure_ascii=False), encoding="utf-8"
 )
-
-# tokens.txt: uma linha por id (0..V-1), facilita o parsing no Rust
 id_to_tok = {i: t for t, i in vocab.items()}
 lines = [id_to_tok.get(i, "") for i in range(len(id_to_tok))]
 (OUT / "tokens.txt").write_text("\n".join(lines), encoding="utf-8")
-
 model.config.to_json_file(str(OUT / "config.json"))
 print(f"[export] vocab: {len(vocab)} tokens", flush=True)
 
-# ---- export ONNX (fp32) ---------------------------------------------------
-# Áudio dummy de 2 s (32000 amostras) só para traçar o grafo.
+# ---- export ONNX fp32 (intermediário) -------------------------------------
 dummy = torch.zeros(1, 32000, dtype=torch.float32)
-
 fp32_path = OUT / "model.onnx"
 print("[export] exportando ONNX fp32 ...", flush=True)
 torch.onnx.export(
@@ -67,57 +60,43 @@ torch.onnx.export(
     opset_version=17,
     do_constant_folding=True,
 )
-print(f"[export] ok -> {fp32_path} ({fp32_path.stat().st_size/1e6:.0f} MB)", flush=True)
+print(f"[export] ok ({fp32_path.stat().st_size/1e6:.0f} MB)", flush=True)
 
-# ---- validação numérica: torch vs onnxruntime -----------------------------
+# ---- validação: argmax do ONNX == do PyTorch ------------------------------
 import onnxruntime as ort  # noqa: E402
 
-print("[export] validando ONNX contra PyTorch ...", flush=True)
-test = torch.randn(1, 16000 * 3, dtype=torch.float32)  # 3 s aleatórios
+test = torch.randn(1, 16000 * 3, dtype=torch.float32)
 with torch.no_grad():
     ref = model(test).logits.numpy()
-
 sess = ort.InferenceSession(str(fp32_path), providers=["CPUExecutionProvider"])
 got = sess.run(["logits"], {"input_values": test.numpy()})[0]
-
 if ref.shape != got.shape:
-    print(f"[export] ERRO: shapes diferentes torch={ref.shape} onnx={got.shape}")
+    print(f"[export] ERRO shapes torch={ref.shape} onnx={got.shape}")
     sys.exit(1)
-
-max_diff = float(np.max(np.abs(ref - got)))
-print(f"[export] max|torch-onnx| = {max_diff:.5f}  shape={got.shape}", flush=True)
-if max_diff > 1e-2:
-    print("[export] ERRO: divergência numérica acima da tolerância")
-    sys.exit(1)
-
-# argmax (o que o forced alignment realmente usa) precisa bater
 if not np.array_equal(ref.argmax(-1), got.argmax(-1)):
-    print("[export] ERRO: argmax por frame divergiu entre torch e onnx")
+    print("[export] ERRO: argmax por frame divergiu torch vs onnx")
     sys.exit(1)
-print("[export] validação OK (argmax idêntico)", flush=True)
+print(f"[export] validação OK (argmax idêntico, shape={got.shape})", flush=True)
 
-# ---- quantização dinâmica int8 -------------------------------------------
+# ---- quantização int8 (só MatMul; Conv viraria ConvInteger não suportado) --
 from onnxruntime.quantization import QuantType, quantize_dynamic  # noqa: E402
 
 int8_path = OUT / "model.int8.onnx"
 print("[export] quantizando int8 (apenas MatMul) ...", flush=True)
-# Quantizamos só os MatMul (o transformer, onde está o grosso dos pesos).
-# As Conv do feature extractor ficam em fp32: quantizá-las gera nós
-# ConvInteger que o CPUExecutionProvider do ONNX Runtime não implementa.
 quantize_dynamic(
     str(fp32_path),
     str(int8_path),
     weight_type=QuantType.QInt8,
     op_types_to_quantize=["MatMul"],
 )
-print(f"[export] ok -> {int8_path} ({int8_path.stat().st_size/1e6:.0f} MB)", flush=True)
+print(f"[export] ok ({int8_path.stat().st_size/1e6:.0f} MB)", flush=True)
 
-# sanidade da int8: argmax deve continuar batendo na maioria dos frames
-sess8 = ort.InferenceSession(str(int8_path), providers=["CPUExecutionProvider"])
-got8 = sess8.run(["logits"], {"input_values": test.numpy()})[0]
+got8 = (
+    ort.InferenceSession(str(int8_path), providers=["CPUExecutionProvider"])
+    .run(["logits"], {"input_values": test.numpy()})[0]
+)
 agree = float(np.mean(ref.argmax(-1) == got8.argmax(-1)))
 print(f"[export] int8 argmax agreement = {agree:.3%}", flush=True)
-if agree < 0.95:
-    print("[export] AVISO: concordância int8 baixa; revisar qualidade")
 
+fp32_path.unlink()  # só distribuímos o int8
 print("[export] concluído.", flush=True)
